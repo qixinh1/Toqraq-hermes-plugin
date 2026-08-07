@@ -1,0 +1,10 @@
+#!/usr/bin/env python
+# Build rules for the Toqraq bridge module.
+from misc.utility.scons_hints import *
+
+Import("env")
+Import("env_modules")
+
+env_toqraq = env_modules.Clone()
+
+env_toqraq.add_source_files(env.modules_sources, "*.cpp")

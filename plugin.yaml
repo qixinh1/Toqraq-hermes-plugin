@@ -1,0 +1,29 @@
+manifest_version: 2
+name: toqraq
+kind: standalone
+version: 0.1.0
+description: Run, display, inspect, and control game engines from Hermes Desktop.
+author: Toqraq contributors
+desktop_entry: desktop/plugin.js
+provides_tools:
+  - toqraq_project_setup
+  - toqraq_project_read_inventory
+  - toqraq_game_start
+  - toqraq_game_stop
+  - toqraq_game_pause
+  - toqraq_game_resume
+  - toqraq_game_step
+  - toqraq_game_read_hierarchy
+  - toqraq_game_read_objects
+  - toqraq_game_read_diagnostics
+  - toqraq_game_read_process_output
+  - toqraq_game_read_metrics
+  - toqraq_game_capture_frame
+  - toqraq_game_input_semantic
+  - toqraq_game_input_keyboard
+  - toqraq_game_input_pointer
+  - toqraq_game_input_text
+  - toqraq_game_input_gamepad
+provides_hooks:
+  - on_session_finalize
+  - pre_llm_call

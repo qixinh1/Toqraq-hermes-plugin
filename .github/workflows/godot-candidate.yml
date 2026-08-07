@@ -1,0 +1,230 @@
+name: godot-candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Exact Godot stable tag, for example 4.7.1-stable
+        required: true
+        type: string
+      upstream_commit:
+        description: Exact 40-character commit behind the stable tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: godot-candidate-${{ inputs.upstream_commit }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GODOT_SCONS_ARGS: >-
+    platform=windows target=editor arch=x86_64 production=yes
+    d3d12=no accesskit=no winrt=no angle=no tests=yes
+  TOQRAQ_DISTRIBUTION_ID: toqraq.godot.windows.x86_64
+
+jobs:
+  windows-x86-64:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out Toqraq
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          path: toqraq
+          persist-credentials: false
+
+      - name: Validate exact upstream identity
+        shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          if ($env:UPSTREAM_TAG -cnotmatch '^[0-9]+\.[0-9]+(?:\.[0-9]+)?-stable$') {
+            throw 'upstream_tag must be one exact stable tag'
+          }
+          if ($env:UPSTREAM_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'upstream_commit must be one lowercase full commit'
+          }
+
+      - name: Check out exact upstream Godot commit
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          repository: godotengine/godot
+          ref: ${{ inputs.upstream_commit }}
+          path: godot
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prove tag, commit, and clean upstream tree
+        shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          & git -C godot fetch --depth=1 https://github.com/godotengine/godot.git `
+            "refs/tags/$($env:UPSTREAM_TAG):refs/tags/$($env:UPSTREAM_TAG)"
+          if ($LASTEXITCODE -ne 0) { throw 'failed to fetch exact upstream tag' }
+          $head = (& git -C godot rev-parse HEAD).Trim()
+          $tagCommit = (& git -C godot rev-parse "refs/tags/$($env:UPSTREAM_TAG)^{commit}").Trim()
+          if ($head -cne $env:UPSTREAM_COMMIT -or $tagCommit -cne $env:UPSTREAM_COMMIT) {
+            throw 'upstream tag and commit do not identify the same source tree'
+          }
+          $dirty = & git -C godot status --porcelain=v1 --untracked-files=all
+          if ($dirty) { throw 'upstream checkout is not clean before composition' }
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            toqraq/engine/godot/build-requirements.txt
+            toqraq/engine/godot/candidate-test-requirements.txt
+
+      - name: Install pinned build tool
+        run: >-
+          python -m pip install --disable-pip-version-check --require-hashes
+          --requirement toqraq/engine/godot/build-requirements.txt
+
+      - name: Derive intrinsic candidate identity
+        shell: pwsh
+        env:
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          $pluginCommit = (& git -C toqraq rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $pluginCommit -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'failed to identify the exact Toqraq commit'
+          }
+          $moduleTree = (& git -C toqraq rev-parse HEAD:engine/godot/modules/toqraq).Trim()
+          if ($LASTEXITCODE -ne 0 -or $moduleTree -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'failed to identify the exact Toqraq module tree'
+          }
+          $recipe = "$($env:UPSTREAM_COMMIT)`n$moduleTree`n$($env:GODOT_SCONS_ARGS)"
+          $recipeBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($recipe)
+          $recipeDigest = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($recipeBytes)
+          ).ToLowerInvariant()
+          $buildId = "gh.$($env:GITHUB_RUN_ID).$($env:GITHUB_RUN_ATTEMPT).$recipeDigest"
+          if ($buildId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$') {
+            throw 'derived build identity violates the native module contract'
+          }
+          "TOQRAQ_COMMIT=$pluginCommit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TOQRAQ_MODULE_TREE=$moduleTree" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TOQRAQ_RECIPE_DIGEST=$recipeDigest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TOQRAQ_BUILD_ID=$buildId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build with the external Toqraq module
+        shell: pwsh
+        working-directory: godot
+        run: |
+          $moduleCollection = (Resolve-Path ../toqraq/engine/godot/modules).Path
+          $arguments = $env:GODOT_SCONS_ARGS -split '\s+'
+          python -m SCons @arguments "custom_modules=$moduleCollection" `
+            "toqraq_build_id=$($env:TOQRAQ_BUILD_ID)" `
+            "toqraq_distribution_id=$($env:TOQRAQ_DISTRIBUTION_ID)" `
+            "-j$($env:NUMBER_OF_PROCESSORS)"
+          if ($LASTEXITCODE -ne 0) { throw 'Godot candidate build failed' }
+
+      - name: Run upstream tests and binary smoke check
+        shell: pwsh
+        run: |
+          $engine = (Resolve-Path godot/bin/godot.windows.editor.x86_64.exe).Path
+          $nativeOutput = & $engine --test --test-case='*[Toqraq]*' --no-colors --duration 2>&1
+          $nativeExit = $LASTEXITCODE
+          $nativeOutput | Write-Output
+          if ($nativeExit -ne 0) { throw 'Toqraq native tests reported failure' }
+          if (-not ($nativeOutput | Select-String -SimpleMatch '[Toqraq]' -Quiet)) {
+            throw 'Toqraq native test filter matched no reported suite'
+          }
+          & $engine --headless --version
+          if ($LASTEXITCODE -ne 0) { throw 'Godot candidate did not start' }
+
+      - name: Prove source trees stayed untouched
+        shell: pwsh
+        run: |
+          & git -C godot diff --exit-code --no-ext-diff HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'candidate build modified upstream source' }
+          $toqraqDirty = & git -C toqraq status --porcelain=v1 --untracked-files=all
+          if ($LASTEXITCODE -ne 0 -or $toqraqDirty) {
+            throw 'candidate build modified Toqraq source'
+          }
+
+      - name: Install post-build conformance dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: `
+            --require-hashes `
+            --requirement toqraq/engine/godot/candidate-test-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'failed to install candidate test dependencies' }
+          $versions = (& python -c 'import pydantic, pytest, websockets; print(pydantic.__version__, pytest.__version__, websockets.__version__)').Trim()
+          if ($versions -cne '2.13.4 9.1.1 15.0.1') {
+            throw 'candidate tests did not resolve the reviewed Python dependency set'
+          }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'candidate test dependencies are inconsistent' }
+
+      - name: Verify deterministic candidate packager
+        working-directory: toqraq
+        run: python -m pytest tests/python/test_godot_candidate_package.py -q
+
+      - name: Package deterministic candidate
+        shell: pwsh
+        working-directory: toqraq
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+        run: |
+          $pythonVersion = (& python -c 'import platform; print(platform.python_version())').Trim()
+          $sconsVersion = (& python -c 'import SCons; print(SCons.__version__)').Trim()
+          $packageArguments = @(
+            '-m', 'scripts.package_godot_candidate',
+            '--executable', (Resolve-Path '../godot/bin/godot.windows.editor.x86_64.exe').Path,
+            '--godot-license', (Resolve-Path '../godot/LICENSE.txt').Path,
+            '--godot-copyright', (Resolve-Path '../godot/COPYRIGHT.txt').Path,
+            '--toqraq-license', (Resolve-Path 'LICENSE').Path,
+            '--output-directory', (Join-Path (Resolve-Path '..').Path 'candidate'),
+            '--upstream-tag', $env:UPSTREAM_TAG,
+            '--upstream-commit', $env:UPSTREAM_COMMIT,
+            '--toqraq-commit', $env:TOQRAQ_COMMIT,
+            '--module-git-tree', $env:TOQRAQ_MODULE_TREE,
+            '--recipe-sha256', $env:TOQRAQ_RECIPE_DIGEST,
+            '--build-id', $env:TOQRAQ_BUILD_ID,
+            '--distribution-id', $env:TOQRAQ_DISTRIBUTION_ID,
+            '--workflow-run-id', $env:GITHUB_RUN_ID,
+            '--workflow-run-attempt', $env:GITHUB_RUN_ATTEMPT,
+            '--runner-image', $env:ImageOS,
+            '--runner-image-version', $env:ImageVersion,
+            '--python-version', $pythonVersion,
+            '--scons-version', $sconsVersion
+          )
+          foreach ($option in ($env:GODOT_SCONS_ARGS -split '\s+')) {
+            $packageArguments += @('--scons-argument', $option)
+          }
+          & python @packageArguments
+          if ($LASTEXITCODE -ne 0) { throw 'candidate packaging failed' }
+
+      - name: Exercise the exact packaged executable
+        shell: pwsh
+        working-directory: toqraq
+        env:
+          TOQRAQ_GODOT_CANDIDATE_DIR: ${{ github.workspace }}\candidate
+        run: |
+          & python -m pytest tests/python/test_integration_godot_native_bridge.py `
+            -m integration -q
+          if ($LASTEXITCODE -ne 0) {
+            throw 'packaged candidate failed the production Bridge exercise'
+          }
+
+      - name: Upload uncertified candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: godot-${{ inputs.upstream_tag }}-windows-x86-64-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

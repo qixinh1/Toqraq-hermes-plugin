@@ -1,0 +1,18 @@
+config_version=5
+
+[application]
+
+config/name="ToqraqTest"
+run/main_scene="res://main.tscn"
+
+[display]
+
+window/size/viewport_width=960
+window/size/viewport_height=540
+
+[input]
+
+toqraq_test={
+"deadzone": 0.5,
+"events": []
+}

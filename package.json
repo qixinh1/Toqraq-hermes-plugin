@@ -1,0 +1,20 @@
+{
+  "name": "toqraq-hermes-plugin",
+  "version": "0.1.0",
+  "description": "Embed and observe game engines inside Hermes Desktop.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "contracts": "python -m scripts.generate_contracts",
+    "contracts:check": "python -m scripts.generate_contracts --check",
+    "build": "python -m scripts.generate_contracts --check && node scripts/build-renderer.mjs",
+    "test": "node scripts/test-renderer.mjs",
+    "typecheck": "node scripts/typecheck-renderer.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}
